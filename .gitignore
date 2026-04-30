@@ -1,4 +1,6 @@
 .env
+*.env.txt
 *.log
 safety-check-log.json
+trades.csv
 node_modules/

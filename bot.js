@@ -112,15 +112,17 @@ function countTodaysTrades(log) {
 async function fetchCandles(symbol, interval, limit = 100) {
   // Map our timeframe format to Binance interval format
   const intervalMap = {
-    "1m": "1m",
-    "3m": "3m",
-    "5m": "5m",
-    "15m": "15m",
-    "30m": "30m",
-    "1H": "1h",
-    "4H": "4h",
-    "1D": "1d",
-    "1W": "1w",
+    "1m": "1m", "1M": "1m",
+    "2m": "1m", "2M": "1m",
+    "3m": "3m", "3M": "3m",
+    "5m": "5m", "5M": "5m",
+    "15m": "15m", "15M": "15m",
+    "30m": "30m", "30M": "30m",
+    "1H": "1h", "1h": "1h",
+    "2H": "2h", "2h": "2h",
+    "4H": "4h", "4h": "4h",
+    "1D": "1d", "1d": "1d",
+    "1W": "1w", "1w": "1w",
   };
   const binanceInterval = intervalMap[interval] || "1m";
 
@@ -531,9 +533,9 @@ async function run() {
 
   console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
   console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 ? rsi3.toFixed(2) : "N/A"}`);
+  console.log(`  RSI(3):  ${rsi3 !== null ? rsi3.toFixed(2) : "N/A"}`);
 
-  if (!vwap || !rsi3) {
+  if (vwap === null || rsi3 === null) {
     console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
     return;
   }
