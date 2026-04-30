@@ -10,7 +10,7 @@
  */
 
 import "dotenv/config";
-import { readFileSync, writeFileSync, existsSync, appendFileSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync } from "fs";
 import crypto from "crypto";
 import { execSync } from "child_process";
 
@@ -60,7 +60,6 @@ function checkOnboarding() {
     process.exit(0);
   }
 
-  // Always print the CSV location so users know where to find their trade log
   const csvPath = new URL("trades.csv", import.meta.url).pathname;
   console.log(`\n📄 Trade log: ${csvPath}`);
   console.log(
@@ -87,9 +86,12 @@ const CONFIG = {
   },
 };
 
-const LOG_FILE = "safety-check-log.json";
+const DATA_DIR = process.env.DATA_DIR || ".";
+const dataPath = (f) => `${DATA_DIR}/${f}`;
 
-// ─── Logging ────────────────────────────────────────────────────────────────
+const LOG_FILE = dataPath("safety-check-log.json");
+
+// ─── Decision Logging ────────────────────────────────────────────────────────
 
 function loadLog() {
   if (!existsSync(LOG_FILE)) return { trades: [] };
@@ -110,7 +112,6 @@ function countTodaysTrades(log) {
 // ─── Market Data (Binance public API — free, no auth) ───────────────────────
 
 async function fetchCandles(symbol, interval, limit = 100) {
-  // Map our timeframe format to Binance interval format
   const intervalMap = {
     "1m": "1m", "1M": "1m",
     "2m": "1m", "2M": "1m",
@@ -196,14 +197,12 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  // Determine bias first
   const bullishBias = price > vwap && price > ema8;
   const bearishBias = price < vwap && price < ema8;
 
   if (bullishBias) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
 
-    // 1. Price above VWAP
     check(
       "Price above VWAP (buyers in control)",
       `> ${vwap.toFixed(2)}`,
@@ -211,7 +210,6 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       price > vwap,
     );
 
-    // 2. Price above EMA(8)
     check(
       "Price above EMA(8) (uptrend confirmed)",
       `> ${ema8.toFixed(2)}`,
@@ -219,7 +217,6 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       price > ema8,
     );
 
-    // 3. RSI(3) pullback
     check(
       "RSI(3) below 30 (snap-back setup in uptrend)",
       "< 30",
@@ -227,7 +224,6 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
       rsi3 < 30,
     );
 
-    // 4. Not overextended from VWAP
     const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
     check(
       "Price within 1.5% of VWAP (not overextended)",
@@ -277,7 +273,7 @@ function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
   }
 
   const allPass = results.every((r) => r.pass);
-  return { results, allPass };
+  return { results, allPass, bullishBias, bearishBias };
 }
 
 // ─── Trade Limits ────────────────────────────────────────────────────────────
@@ -369,90 +365,80 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   return data.data;
 }
 
-// ─── Tax CSV Logging ─────────────────────────────────────────────────────────
+// ─── Position Tracking ───────────────────────────────────────────────────────
 
-const CSV_FILE = "trades.csv";
+const POSITIONS_FILE = dataPath("positions.json");
 
-// Always ensure trades.csv exists with headers — open it in Excel/Sheets any time
-function initCsv() {
-  if (!existsSync(CSV_FILE)) {
-    const funnyNote = `,,,,,,,,,,,"NOTE","Hey, if you're at this stage of the video, you must be enjoying it... perhaps you could hit subscribe now? :)"`;
-    writeFileSync(CSV_FILE, CSV_HEADERS + "\n" + funnyNote + "\n");
-    console.log(
-      `📄 Created ${CSV_FILE} — open in Google Sheets or Excel to track trades.`,
-    );
+function loadPositions() {
+  if (!existsSync(POSITIONS_FILE)) {
+    return { openPosition: null, runningBalance: CONFIG.portfolioValue };
   }
+  return JSON.parse(readFileSync(POSITIONS_FILE, "utf8"));
 }
+
+function savePositions(data) {
+  writeFileSync(POSITIONS_FILE, JSON.stringify(data, null, 2));
+}
+
+// ─── Trade CSV ───────────────────────────────────────────────────────────────
+
+const CSV_FILE = dataPath("trades.csv");
 const CSV_HEADERS = [
   "Date",
   "Time (UTC)",
-  "Exchange",
   "Symbol",
   "Side",
+  "Entry Price",
+  "Exit Price",
   "Quantity",
-  "Price",
-  "Total USD",
-  "Fee (est.)",
-  "Net Amount",
-  "Order ID",
+  "P&L USD",
+  "Running Balance USD",
   "Mode",
   "Notes",
 ].join(",");
 
-function writeTradeCsv(logEntry) {
-  const now = new Date(logEntry.timestamp);
+function initCsv() {
+  if (existsSync(CSV_FILE)) {
+    // Archive old format if it has the old headers
+    const firstLine = readFileSync(CSV_FILE, "utf8").split("\n")[0];
+    if (!firstLine.startsWith("Date,Time (UTC),Symbol,Side,Entry Price")) {
+      const archiveName = dataPath(`trades-archive-${Date.now()}.csv`);
+      renameSync(CSV_FILE, archiveName);
+      console.log(`📦 Old trades.csv archived to ${archiveName}`);
+    }
+  }
+  if (!existsSync(CSV_FILE)) {
+    writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
+    console.log(`📄 Created ${CSV_FILE}`);
+  }
+}
+
+function writeTradeCsvRow({
+  symbol,
+  side,
+  entryPrice,
+  exitPrice,
+  quantity,
+  pnl,
+  runningBalance,
+  timestamp,
+  mode,
+  notes,
+}) {
+  const now = new Date(timestamp);
   const date = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
-
-  let side = "";
-  let quantity = "";
-  let totalUSD = "";
-  let fee = "";
-  let netAmount = "";
-  let orderId = "";
-  let mode = "";
-  let notes = "";
-
-  if (!logEntry.allPass) {
-    const failed = logEntry.conditions
-      .filter((c) => !c.pass)
-      .map((c) => c.label)
-      .join("; ");
-    mode = "BLOCKED";
-    orderId = "BLOCKED";
-    notes = `Failed: ${failed}`;
-  } else if (logEntry.paperTrading) {
-    side = "BUY";
-    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
-    totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
-    netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
-    orderId = logEntry.orderId || "";
-    mode = "PAPER";
-    notes = "All conditions met";
-  } else {
-    side = "BUY";
-    quantity = (logEntry.tradeSize / logEntry.price).toFixed(6);
-    totalUSD = logEntry.tradeSize.toFixed(2);
-    fee = (logEntry.tradeSize * 0.001).toFixed(4);
-    netAmount = (logEntry.tradeSize - parseFloat(fee)).toFixed(2);
-    orderId = logEntry.orderId || "";
-    mode = "LIVE";
-    notes = logEntry.error ? `Error: ${logEntry.error}` : "All conditions met";
-  }
 
   const row = [
     date,
     time,
-    "BitGet",
-    logEntry.symbol,
+    symbol,
     side,
-    quantity,
-    logEntry.price.toFixed(2),
-    totalUSD,
-    fee,
-    netAmount,
-    orderId,
+    entryPrice.toFixed(2),
+    exitPrice !== null ? exitPrice.toFixed(2) : "",
+    quantity.toFixed(6),
+    pnl !== null ? pnl.toFixed(2) : "",
+    runningBalance.toFixed(2),
     mode,
     `"${notes}"`,
   ].join(",");
@@ -460,12 +446,12 @@ function writeTradeCsv(logEntry) {
   if (!existsSync(CSV_FILE)) {
     writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
   }
-
   appendFileSync(CSV_FILE, row + "\n");
-  console.log(`Tax record saved → ${CSV_FILE}`);
+  console.log(`📄 Trade logged → ${CSV_FILE}`);
 }
 
-// Tax summary command: node bot.js --tax-summary
+// ─── Tax Summary ─────────────────────────────────────────────────────────────
+
 function generateTaxSummary() {
   if (!existsSync(CSV_FILE)) {
     console.log("No trades.csv found — no trades have been recorded yet.");
@@ -473,22 +459,37 @@ function generateTaxSummary() {
   }
 
   const lines = readFileSync(CSV_FILE, "utf8").trim().split("\n");
-  const rows = lines.slice(1).map((l) => l.split(","));
+  const rows = lines.slice(1).filter((l) => l.trim()).map((l) => l.split(","));
 
-  const live = rows.filter((r) => r[11] === "LIVE");
-  const paper = rows.filter((r) => r[11] === "PAPER");
-  const blocked = rows.filter((r) => r[11] === "BLOCKED");
+  const sells = rows.filter((r) => r[3] === "SELL");
+  const buys = rows.filter((r) => r[3] === "BUY");
+  const paper = rows.filter((r) => r[9] === "PAPER");
+  const live = rows.filter((r) => r[9] === "LIVE");
 
-  const totalVolume = live.reduce((sum, r) => sum + parseFloat(r[7] || 0), 0);
-  const totalFees = live.reduce((sum, r) => sum + parseFloat(r[8] || 0), 0);
+  const totalPnl = sells.reduce((sum, r) => sum + parseFloat(r[7] || 0), 0);
+  const wins = sells.filter((r) => parseFloat(r[7] || 0) > 0).length;
+  const losses = sells.filter((r) => parseFloat(r[7] || 0) <= 0).length;
+
+  let currentBalance = CONFIG.portfolioValue;
+  if (sells.length > 0) {
+    currentBalance = parseFloat(sells[sells.length - 1][8]);
+  }
 
   console.log("\n── Tax Summary ──────────────────────────────────────────\n");
-  console.log(`  Total decisions logged : ${rows.length}`);
-  console.log(`  Live trades executed   : ${live.length}`);
+  console.log(`  Starting balance       : $${CONFIG.portfolioValue.toFixed(2)}`);
+  console.log(`  Current balance        : $${currentBalance.toFixed(2)}`);
+  console.log(`  Total realised P&L     : ${totalPnl >= 0 ? "+" : ""}$${totalPnl.toFixed(2)}`);
+  console.log(`  ─────────────────────────────────────────────────────`);
+  console.log(`  Total entries (BUY)    : ${buys.length}`);
+  console.log(`  Total exits (SELL)     : ${sells.length}`);
+  console.log(`  Winning trades         : ${wins}`);
+  console.log(`  Losing trades          : ${losses}`);
+  if (sells.length > 0) {
+    console.log(`  Win rate               : ${((wins / sells.length) * 100).toFixed(0)}%`);
+  }
+  console.log(`  ─────────────────────────────────────────────────────`);
   console.log(`  Paper trades           : ${paper.length}`);
-  console.log(`  Blocked by safety check: ${blocked.length}`);
-  console.log(`  Total volume (USD)     : $${totalVolume.toFixed(2)}`);
-  console.log(`  Total fees paid (est.) : $${totalFees.toFixed(4)}`);
+  console.log(`  Live trades            : ${live.length}`);
   console.log(`\n  Full record: ${CSV_FILE}`);
   console.log("─────────────────────────────────────────────────────────\n");
 }
@@ -506,12 +507,10 @@ async function run() {
   );
   console.log("═══════════════════════════════════════════════════════════");
 
-  // Load strategy
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
   console.log(`\nStrategy: ${rules.strategy.name}`);
   console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
 
-  // Load log and check daily limits
   const log = loadLog();
   const withinLimits = checkTradeLimits(log);
   if (!withinLimits) {
@@ -519,7 +518,7 @@ async function run() {
     return;
   }
 
-  // Fetch candle data — need enough for EMA(8) + full session for VWAP
+  // Fetch candle data
   console.log("\n── Fetching market data from Binance ───────────────────\n");
   const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
   const closes = candles.map((c) => c.close);
@@ -540,18 +539,136 @@ async function run() {
     return;
   }
 
-  // Run safety check
-  const { results, allPass } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+  const { results, allPass, bullishBias } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
 
-  // Calculate position size
   const tradeSize = Math.min(
     CONFIG.portfolioValue * 0.01,
     CONFIG.maxTradeSizeUSD,
   );
 
-  // Decision
+  // ─── Position Management ──────────────────────────────────────────────────
+
+  const positions = loadPositions();
+
   console.log("\n── Decision ─────────────────────────────────────────────\n");
 
+  if (positions.openPosition) {
+    // We're in a trade — check if we should exit
+    const pos = positions.openPosition;
+    const unrealisedPnl = (price - pos.entryPrice) * pos.quantity;
+
+    if (!bullishBias) {
+      // Bias has shifted — exit the position
+      const pnl = (price - pos.entryPrice) * pos.quantity;
+      const newBalance = positions.runningBalance + pnl;
+      const pnlStr = `${pnl >= 0 ? "+" : ""}$${pnl.toFixed(2)}`;
+
+      console.log(`📤 CLOSING POSITION — bias no longer bullish`);
+      console.log(`   Entry:   $${pos.entryPrice.toFixed(2)}`);
+      console.log(`   Exit:    $${price.toFixed(2)}`);
+      console.log(`   Qty:     ${pos.quantity.toFixed(6)}`);
+      console.log(`   P&L:     ${pnlStr}`);
+      console.log(`   Balance: $${newBalance.toFixed(2)}`);
+
+      writeTradeCsvRow({
+        symbol: CONFIG.symbol,
+        side: "SELL",
+        entryPrice: pos.entryPrice,
+        exitPrice: price,
+        quantity: pos.quantity,
+        pnl,
+        runningBalance: newBalance,
+        timestamp: new Date().toISOString(),
+        mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
+        notes: "Exit — bias no longer bullish",
+      });
+
+      positions.openPosition = null;
+      positions.runningBalance = newBalance;
+      savePositions(positions);
+    } else {
+      // Still bullish — hold
+      console.log(`📊 HOLDING POSITION`);
+      console.log(`   Entry: $${pos.entryPrice.toFixed(2)} | Now: $${price.toFixed(2)}`);
+      console.log(`   Unrealised P&L: ${unrealisedPnl >= 0 ? "+" : ""}$${unrealisedPnl.toFixed(2)}`);
+      console.log(`   Balance (excl. open trade): $${positions.runningBalance.toFixed(2)}`);
+    }
+  } else {
+    // No open position — check if we should enter
+    if (!allPass) {
+      const failed = results.filter((r) => !r.pass).map((r) => r.label);
+      console.log(`🚫 TRADE BLOCKED`);
+      console.log(`   Failed conditions:`);
+      failed.forEach((f) => console.log(`   - ${f}`));
+    } else {
+      // All conditions met — enter a trade
+      const quantity = tradeSize / price;
+
+      if (CONFIG.paperTrading) {
+        console.log(`✅ ALL CONDITIONS MET`);
+        console.log(`\n📋 PAPER TRADE — BUY ${quantity.toFixed(6)} ${CONFIG.symbol} @ $${price.toFixed(2)}`);
+        console.log(`   Size: $${tradeSize.toFixed(2)} | Balance: $${positions.runningBalance.toFixed(2)}`);
+        console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
+
+        positions.openPosition = {
+          symbol: CONFIG.symbol,
+          entryPrice: price,
+          quantity,
+          tradeSize,
+          entryTime: new Date().toISOString(),
+        };
+        savePositions(positions);
+
+        writeTradeCsvRow({
+          symbol: CONFIG.symbol,
+          side: "BUY",
+          entryPrice: price,
+          exitPrice: null,
+          quantity,
+          pnl: null,
+          runningBalance: positions.runningBalance,
+          timestamp: new Date().toISOString(),
+          mode: "PAPER",
+          notes: "Entry — all conditions met",
+        });
+      } else {
+        console.log(`✅ ALL CONDITIONS MET`);
+        console.log(`\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`);
+        try {
+          const order = await placeBitGetOrder(CONFIG.symbol, "buy", tradeSize, price);
+
+          positions.openPosition = {
+            symbol: CONFIG.symbol,
+            entryPrice: price,
+            quantity,
+            tradeSize,
+            entryTime: new Date().toISOString(),
+            orderId: order.orderId,
+          };
+          savePositions(positions);
+
+          writeTradeCsvRow({
+            symbol: CONFIG.symbol,
+            side: "BUY",
+            entryPrice: price,
+            exitPrice: null,
+            quantity,
+            pnl: null,
+            runningBalance: positions.runningBalance,
+            timestamp: new Date().toISOString(),
+            mode: "LIVE",
+            notes: `Order ${order.orderId}`,
+          });
+
+          console.log(`✅ ORDER PLACED — ${order.orderId}`);
+        } catch (err) {
+          console.log(`❌ ORDER FAILED — ${err.message}`);
+        }
+      }
+    }
+  }
+
+  // Save decision log
   const logEntry = {
     timestamp: new Date().toISOString(),
     symbol: CONFIG.symbol,
@@ -560,60 +677,16 @@ async function run() {
     indicators: { ema8, vwap, rsi3 },
     conditions: results,
     allPass,
-    tradeSize,
-    orderPlaced: false,
-    orderId: null,
-    paperTrading: CONFIG.paperTrading,
+    orderPlaced: allPass && !positions.openPosition,
     limits: {
       maxTradeSizeUSD: CONFIG.maxTradeSizeUSD,
       maxTradesPerDay: CONFIG.maxTradesPerDay,
       tradesToday: countTodaysTrades(log),
     },
   };
-
-  if (!allPass) {
-    const failed = results.filter((r) => !r.pass).map((r) => r.label);
-    console.log(`🚫 TRADE BLOCKED`);
-    console.log(`   Failed conditions:`);
-    failed.forEach((f) => console.log(`   - ${f}`));
-  } else {
-    console.log(`✅ ALL CONDITIONS MET`);
-
-    if (CONFIG.paperTrading) {
-      console.log(
-        `\n📋 PAPER TRADE — would buy ${CONFIG.symbol} ~$${tradeSize.toFixed(2)} at market`,
-      );
-      console.log(`   (Set PAPER_TRADING=false in .env to place real orders)`);
-      logEntry.orderPlaced = true;
-      logEntry.orderId = `PAPER-${Date.now()}`;
-    } else {
-      console.log(
-        `\n🔴 PLACING LIVE ORDER — $${tradeSize.toFixed(2)} BUY ${CONFIG.symbol}`,
-      );
-      try {
-        const order = await placeBitGetOrder(
-          CONFIG.symbol,
-          "buy",
-          tradeSize,
-          price,
-        );
-        logEntry.orderPlaced = true;
-        logEntry.orderId = order.orderId;
-        console.log(`✅ ORDER PLACED — ${order.orderId}`);
-      } catch (err) {
-        console.log(`❌ ORDER FAILED — ${err.message}`);
-        logEntry.error = err.message;
-      }
-    }
-  }
-
-  // Save decision log
   log.trades.push(logEntry);
   saveLog(log);
   console.log(`\nDecision log saved → ${LOG_FILE}`);
-
-  // Write tax CSV row for every run (executed, paper, or blocked)
-  writeTradeCsv(logEntry);
 
   console.log("═══════════════════════════════════════════════════════════\n");
 }
