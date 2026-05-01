@@ -144,29 +144,10 @@ async function fetchCandles(symbol, interval, limit = 100) {
 
 // ─── Indicator Calculations ──────────────────────────────────────────────────
 
-function calcEMA(closes, period) {
-  const multiplier = 2 / (period + 1);
-  let ema = closes.slice(0, period).reduce((a, b) => a + b, 0) / period;
-  for (let i = period; i < closes.length; i++) {
-    ema = closes[i] * multiplier + ema * (1 - multiplier);
-  }
-  return ema;
-}
-
-function calcRSI(closes, period = 14) {
-  if (closes.length < period + 1) return null;
-  let gains = 0,
-    losses = 0;
-  for (let i = closes.length - period; i < closes.length; i++) {
-    const diff = closes[i] - closes[i - 1];
-    if (diff > 0) gains += diff;
-    else losses -= diff;
-  }
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - 100 / (1 + rs);
+function calcSMA(closes, period) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(closes.length - period);
+  return slice.reduce((a, b) => a + b, 0) / period;
 }
 
 // VWAP — session-based, resets at midnight UTC
@@ -185,94 +166,82 @@ function calcVWAP(candles) {
 
 // ─── Safety Check ───────────────────────────────────────────────────────────
 
-function runSafetyCheck(price, ema8, vwap, rsi3, rules) {
+function runSafetyCheck(price, prevClose, sma20, sma20Prev, sma200, vwap) {
   const results = [];
 
   const check = (label, required, actual, pass) => {
     results.push({ label, required, actual, pass });
-    const icon = pass ? "✅" : "🚫";
-    console.log(`  ${icon} ${label}`);
+    console.log(`  ${pass ? "✅" : "🚫"} ${label}`);
     console.log(`     Required: ${required} | Actual: ${actual}`);
   };
 
   console.log("\n── Safety Check ─────────────────────────────────────────\n");
 
-  const bullishBias = price > vwap && price > ema8;
-  const bearishBias = price < vwap && price < ema8;
+  const crossoverBullish = prevClose < sma20Prev && price > sma20;
+  const crossoverBearish = prevClose > sma20Prev && price < sma20;
+  const bullishTrend = price > sma200 && price > vwap;
+  const bearishTrend = price < sma200 && price < vwap;
 
-  if (bullishBias) {
+  if (bullishTrend) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
 
     check(
-      "Price above VWAP (buyers in control)",
+      "Price above 200 SMA (uptrend)",
+      `> ${sma200.toFixed(2)}`,
+      price.toFixed(2),
+      price > sma200,
+    );
+
+    check(
+      "Price above VWAP (Trend Friend — buyers in control)",
       `> ${vwap.toFixed(2)}`,
       price.toFixed(2),
       price > vwap,
     );
 
     check(
-      "Price above EMA(8) (uptrend confirmed)",
-      `> ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price > ema8,
+      "20 SMA bullish crossover (entry signal)",
+      `prev < ${sma20Prev.toFixed(2)}, now > ${sma20.toFixed(2)}`,
+      `${prevClose.toFixed(2)} → ${price.toFixed(2)}`,
+      crossoverBullish,
     );
-
-    check(
-      "RSI(3) below 30 (snap-back setup in uptrend)",
-      "< 30",
-      rsi3.toFixed(2),
-      rsi3 < 30,
-    );
-
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
-    );
-  } else if (bearishBias) {
+  } else if (bearishTrend) {
     console.log("  Bias: BEARISH — checking short entry conditions\n");
 
     check(
-      "Price below VWAP (sellers in control)",
+      "Price below 200 SMA (downtrend)",
+      `< ${sma200.toFixed(2)}`,
+      price.toFixed(2),
+      price < sma200,
+    );
+
+    check(
+      "Price below VWAP (Trend Friend — sellers in control)",
       `< ${vwap.toFixed(2)}`,
       price.toFixed(2),
       price < vwap,
     );
 
     check(
-      "Price below EMA(8) (downtrend confirmed)",
-      `< ${ema8.toFixed(2)}`,
-      price.toFixed(2),
-      price < ema8,
-    );
-
-    check(
-      "RSI(3) above 70 (reversal setup in downtrend)",
-      "> 70",
-      rsi3.toFixed(2),
-      rsi3 > 70,
-    );
-
-    const distFromVWAP = Math.abs((price - vwap) / vwap) * 100;
-    check(
-      "Price within 1.5% of VWAP (not overextended)",
-      "< 1.5%",
-      `${distFromVWAP.toFixed(2)}%`,
-      distFromVWAP < 1.5,
+      "20 SMA bearish crossover (entry signal)",
+      `prev > ${sma20Prev.toFixed(2)}, now < ${sma20.toFixed(2)}`,
+      `${prevClose.toFixed(2)} → ${price.toFixed(2)}`,
+      crossoverBearish,
     );
   } else {
-    console.log("  Bias: NEUTRAL — no clear direction. No trade.\n");
+    console.log("  Bias: NEUTRAL — SMA200 and VWAP not aligned. No trade.\n");
     results.push({
       label: "Market bias",
-      required: "Bullish or bearish",
+      required: "Price aligned with SMA200 and VWAP",
       actual: "Neutral",
       pass: false,
     });
   }
 
   const allPass = results.every((r) => r.pass);
+  // Hold while price remains above all three indicators (exit trigger)
+  const bullishBias = price > sma20 && price > sma200 && price > vwap;
+  const bearishBias = price < sma20 && price < sma200 && price < vwap;
   return { results, allPass, bullishBias, bearishBias };
 }
 
@@ -526,20 +495,22 @@ async function run() {
   console.log(`  Current price: $${price.toFixed(2)}`);
 
   // Calculate indicators
-  const ema8 = calcEMA(closes, 8);
-  const vwap = calcVWAP(candles);
-  const rsi3 = calcRSI(closes, 3);
+  const sma20     = calcSMA(closes, 20);
+  const sma200    = calcSMA(closes, 200);
+  const sma20Prev = calcSMA(closes.slice(0, -1), 20);
+  const prevClose = closes[closes.length - 2];
+  const vwap      = calcVWAP(candles);
 
-  console.log(`  EMA(8):  $${ema8.toFixed(2)}`);
-  console.log(`  VWAP:    $${vwap ? vwap.toFixed(2) : "N/A"}`);
-  console.log(`  RSI(3):  ${rsi3 !== null ? rsi3.toFixed(2) : "N/A"}`);
+  console.log(`  SMA(20):  $${sma20 ? sma20.toFixed(2) : "N/A"}`);
+  console.log(`  SMA(200): $${sma200 ? sma200.toFixed(2) : "N/A"}`);
+  console.log(`  VWAP:     $${vwap ? vwap.toFixed(2) : "N/A"}`);
 
-  if (vwap === null || rsi3 === null) {
+  if (vwap === null || sma200 === null) {
     console.log("\n⚠️  Not enough data to calculate indicators. Exiting.");
     return;
   }
 
-  const { results, allPass, bullishBias } = runSafetyCheck(price, ema8, vwap, rsi3, rules);
+  const { results, allPass, bullishBias } = runSafetyCheck(price, prevClose, sma20, sma20Prev, sma200, vwap);
 
   const tradeSize = Math.min(
     CONFIG.portfolioValue * 0.01,
@@ -674,7 +645,7 @@ async function run() {
     symbol: CONFIG.symbol,
     timeframe: CONFIG.timeframe,
     price,
-    indicators: { ema8, vwap, rsi3 },
+    indicators: { sma20, sma200, vwap },
     conditions: results,
     allPass,
     orderPlaced: allPass && !positions.openPosition,
