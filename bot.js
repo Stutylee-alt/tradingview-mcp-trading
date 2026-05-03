@@ -256,7 +256,7 @@ function checkTradeLimits(log) {
     console.log(
       `🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`,
     );
-    return false;
+    return { allowed: false, reason: `Max trades per day reached (${todayCount}/${CONFIG.maxTradesPerDay})` };
   }
 
   console.log(
@@ -272,14 +272,14 @@ function checkTradeLimits(log) {
     console.log(
       `🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`,
     );
-    return false;
+    return { allowed: false, reason: `Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}` };
   }
 
   console.log(
     `✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`,
   );
 
-  return true;
+  return { allowed: true, reason: "" };
 }
 
 // ─── BitGet Execution ────────────────────────────────────────────────────────
@@ -356,13 +356,19 @@ const CSV_HEADERS = [
   "Date",
   "Time (UTC)",
   "Symbol",
+  "Decision",
   "Side",
   "Entry Price",
   "Exit Price",
   "Quantity",
   "P&L USD",
   "Running Balance USD",
+  "Price",
+  "SMA20",
+  "SMA200",
+  "VWAP",
   "Mode",
+  "Block Reason",
   "Notes",
 ].join(",");
 
@@ -370,7 +376,7 @@ function initCsv() {
   if (existsSync(CSV_FILE)) {
     // Archive old format if it has the old headers
     const firstLine = readFileSync(CSV_FILE, "utf8").split("\n")[0];
-    if (!firstLine.startsWith("Date,Time (UTC),Symbol,Side,Entry Price")) {
+    if (!firstLine.includes("Decision")) {
       const archiveName = dataPath(`trades-archive-${Date.now()}.csv`);
       renameSync(CSV_FILE, archiveName);
       console.log(`📦 Old trades.csv archived to ${archiveName}`);
@@ -382,33 +388,46 @@ function initCsv() {
   }
 }
 
-function writeTradeCsvRow({
+function writeDecisionRow({
+  decision,
   symbol,
-  side,
-  entryPrice,
-  exitPrice,
-  quantity,
-  pnl,
+  side = "",
+  entryPrice = null,
+  exitPrice = null,
+  quantity = null,
+  pnl = null,
   runningBalance,
+  price = null,
+  sma20 = null,
+  sma200 = null,
+  vwap = null,
   timestamp,
   mode,
-  notes,
+  blockReason = "",
+  notes = "",
 }) {
   const now = new Date(timestamp);
   const date = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
+  const fmt = (v, dp = 2) => v !== null && v !== undefined ? v.toFixed(dp) : "";
 
   const row = [
     date,
     time,
     symbol,
+    decision,
     side,
-    entryPrice.toFixed(2),
-    exitPrice !== null ? exitPrice.toFixed(2) : "",
-    quantity.toFixed(6),
-    pnl !== null ? pnl.toFixed(2) : "",
-    runningBalance.toFixed(2),
+    fmt(entryPrice),
+    fmt(exitPrice),
+    fmt(quantity, 6),
+    fmt(pnl),
+    fmt(runningBalance),
+    fmt(price),
+    fmt(sma20),
+    fmt(sma200),
+    fmt(vwap),
     mode,
+    `"${blockReason}"`,
     `"${notes}"`,
   ].join(",");
 
@@ -416,7 +435,7 @@ function writeTradeCsvRow({
     writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
   }
   appendFileSync(CSV_FILE, row + "\n");
-  console.log(`📄 Trade logged → ${CSV_FILE}`);
+  console.log(`📄 Decision logged [${decision}] → ${CSV_FILE}`);
 }
 
 // ─── Tax Summary ─────────────────────────────────────────────────────────────
@@ -432,16 +451,16 @@ function generateTaxSummary() {
 
   const sells = rows.filter((r) => r[3] === "SELL");
   const buys = rows.filter((r) => r[3] === "BUY");
-  const paper = rows.filter((r) => r[9] === "PAPER");
-  const live = rows.filter((r) => r[9] === "LIVE");
+  const paper = rows.filter((r) => r[14] === "PAPER");
+  const live = rows.filter((r) => r[14] === "LIVE");
 
-  const totalPnl = sells.reduce((sum, r) => sum + parseFloat(r[7] || 0), 0);
-  const wins = sells.filter((r) => parseFloat(r[7] || 0) > 0).length;
-  const losses = sells.filter((r) => parseFloat(r[7] || 0) <= 0).length;
+  const totalPnl = sells.reduce((sum, r) => sum + parseFloat(r[8] || 0), 0);
+  const wins = sells.filter((r) => parseFloat(r[8] || 0) > 0).length;
+  const losses = sells.filter((r) => parseFloat(r[8] || 0) <= 0).length;
 
   let currentBalance = CONFIG.portfolioValue;
   if (sells.length > 0) {
-    currentBalance = parseFloat(sells[sells.length - 1][8]);
+    currentBalance = parseFloat(sells[sells.length - 1][9]);
   }
 
   console.log("\n── Tax Summary ──────────────────────────────────────────\n");
@@ -481,8 +500,17 @@ async function run() {
   console.log(`Symbol: ${CONFIG.symbol} | Timeframe: ${CONFIG.timeframe}`);
 
   const log = loadLog();
-  const withinLimits = checkTradeLimits(log);
-  if (!withinLimits) {
+  const { allowed, reason: limitReason } = checkTradeLimits(log);
+  if (!allowed) {
+    const positions = loadPositions();
+    writeDecisionRow({
+      decision: "BLOCKED",
+      symbol: CONFIG.symbol,
+      runningBalance: positions.runningBalance,
+      timestamp: new Date().toISOString(),
+      mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
+      blockReason: limitReason,
+    });
     console.log("\nBot stopping — trade limits reached for today.");
     return;
   }
@@ -541,7 +569,8 @@ async function run() {
       console.log(`   P&L:     ${pnlStr}`);
       console.log(`   Balance: $${newBalance.toFixed(2)}`);
 
-      writeTradeCsvRow({
+      writeDecisionRow({
+        decision: "SELL",
         symbol: CONFIG.symbol,
         side: "SELL",
         entryPrice: pos.entryPrice,
@@ -549,6 +578,10 @@ async function run() {
         quantity: pos.quantity,
         pnl,
         runningBalance: newBalance,
+        price,
+        sma20,
+        sma200,
+        vwap,
         timestamp: new Date().toISOString(),
         mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
         notes: "Exit — bias no longer bullish",
@@ -563,6 +596,22 @@ async function run() {
       console.log(`   Entry: $${pos.entryPrice.toFixed(2)} | Now: $${price.toFixed(2)}`);
       console.log(`   Unrealised P&L: ${unrealisedPnl >= 0 ? "+" : ""}$${unrealisedPnl.toFixed(2)}`);
       console.log(`   Balance (excl. open trade): $${positions.runningBalance.toFixed(2)}`);
+
+      writeDecisionRow({
+        decision: "HOLD",
+        symbol: CONFIG.symbol,
+        side: "BUY",
+        entryPrice: pos.entryPrice,
+        quantity: pos.quantity,
+        runningBalance: positions.runningBalance,
+        price,
+        sma20,
+        sma200,
+        vwap,
+        timestamp: new Date().toISOString(),
+        mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
+        notes: `Unrealised P&L: ${unrealisedPnl >= 0 ? "+" : ""}$${unrealisedPnl.toFixed(2)}`,
+      });
     }
   } else {
     // No open position — check if we should enter
@@ -571,6 +620,19 @@ async function run() {
       console.log(`🚫 TRADE BLOCKED`);
       console.log(`   Failed conditions:`);
       failed.forEach((f) => console.log(`   - ${f}`));
+
+      writeDecisionRow({
+        decision: "BLOCKED",
+        symbol: CONFIG.symbol,
+        runningBalance: positions.runningBalance,
+        price,
+        sma20,
+        sma200,
+        vwap,
+        timestamp: new Date().toISOString(),
+        mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
+        blockReason: failed.join("; "),
+      });
     } else {
       // All conditions met — enter a trade
       const quantity = tradeSize / price;
@@ -590,14 +652,17 @@ async function run() {
         };
         savePositions(positions);
 
-        writeTradeCsvRow({
+        writeDecisionRow({
+          decision: "BUY",
           symbol: CONFIG.symbol,
           side: "BUY",
           entryPrice: price,
-          exitPrice: null,
           quantity,
-          pnl: null,
           runningBalance: positions.runningBalance,
+          price,
+          sma20,
+          sma200,
+          vwap,
           timestamp: new Date().toISOString(),
           mode: "PAPER",
           notes: "Entry — all conditions met",
@@ -618,14 +683,17 @@ async function run() {
           };
           savePositions(positions);
 
-          writeTradeCsvRow({
+          writeDecisionRow({
+            decision: "BUY",
             symbol: CONFIG.symbol,
             side: "BUY",
             entryPrice: price,
-            exitPrice: null,
             quantity,
-            pnl: null,
             runningBalance: positions.runningBalance,
+            price,
+            sma20,
+            sma200,
+            vwap,
             timestamp: new Date().toISOString(),
             mode: "LIVE",
             notes: `Order ${order.orderId}`,

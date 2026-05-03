@@ -3,4 +3,6 @@
 *.log
 safety-check-log.json
 trades.csv
+trades-archive-*.csv
+positions.json
 node_modules/
