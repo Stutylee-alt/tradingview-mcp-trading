@@ -1,8 +1,8 @@
 /**
  * Claude + TradingView MCP — Automated Trading Bot
  *
- * Cloud mode: runs on Railway on a schedule. Pulls candle data direct from
- * Binance (free, no auth), calculates all indicators, runs safety check,
+ * Cloud mode: runs on Railway on a schedule. Pulls candle data from
+ * Bitget API, calculates all indicators, runs safety check,
  * executes via BitGet if everything lines up.
  *
  * Local mode: run manually — node bot.js
@@ -19,7 +19,7 @@ function checkOnboarding() {
   const required = ["BITGET_API_KEY", "BITGET_SECRET_KEY", "BITGET_PASSPHRASE"];
   const missing = required.filter((k) => !process.env[k]);
 
-  // If all credentials are present (e.g. Railway env vars), we're good — skip .env checks
+  // If all credentials are present (e.g. Railway env vars), skip .env checks
   if (missing.length === 0) {
     const csvPath = new URL("trades.csv", import.meta.url).pathname;
     console.log(`\n📄 Trade log: ${csvPath}`);
@@ -32,9 +32,7 @@ function checkOnboarding() {
 
   // Missing credentials — create .env template for local use if it doesn't exist
   if (!existsSync(".env")) {
-    console.log(
-      "\n⚠️  No .env file found — creating a template for you to fill in.\n",
-    );
+    console.log("\n⚠️  No .env file found — creating a template for you to fill in.\n");
     writeFileSync(
       ".env",
       [
@@ -52,9 +50,7 @@ function checkOnboarding() {
         "TIMEFRAME=4H",
       ].join("\n") + "\n",
     );
-    console.log(
-      "Fill in your BitGet credentials in .env then re-run: node bot.js\n",
-    );
+    console.log("Fill in your BitGet credentials in .env then re-run: node bot.js\n");
   } else {
     console.log(`\n⚠️  Missing credentials: ${missing.join(", ")}`);
     console.log("Add the missing values to your .env file (local) or Railway environment variables (cloud).\n");
@@ -104,31 +100,39 @@ function countTodaysTrades(log) {
   ).length;
 }
 
-// ─── Market Data (Binance public API — free, no auth) ───────────────────────
+// ─── Market Data (Bitget public API — uses your existing credentials) ────────
 
-async function fetchCandles(symbol, interval, limit = 100) {
+async function fetchCandles(symbol, interval, limit = 500) {
+  // Map common timeframe strings to Bitget granularity values
   const intervalMap = {
-    "1m": "1m", "1M": "1m",
-    "2m": "1m", "2M": "1m",
-    "3m": "3m", "3M": "3m",
-    "5m": "5m", "5M": "5m",
-    "15m": "15m", "15M": "15m",
-    "30m": "30m", "30M": "30m",
-    "1H": "1h", "1h": "1h",
-    "2H": "2h", "2h": "2h",
-    "4H": "4h", "4h": "4h",
-    "1D": "1d", "1d": "1d",
-    "1W": "1w", "1w": "1w",
+    "1m": "1min",  "1M": "1min",
+    "3m": "3min",  "3M": "3min",
+    "5m": "5min",  "5M": "5min",
+    "15m": "15min","15M": "15min",
+    "30m": "30min","30M": "30min",
+    "1H": "1h",    "1h": "1h",
+    "2H": "2h",    "2h": "2h",
+    "4H": "4h",    "4h": "4h",
+    "6H": "6h",    "6h": "6h",
+    "12H": "12h",  "12h": "12h",
+    "1D": "1day",  "1d": "1day",
+    "1W": "1week", "1w": "1week",
   };
-  const binanceInterval = intervalMap[interval] || "1m";
+  const granularity = intervalMap[interval] || "1h";
 
-  const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${binanceInterval}&limit=${limit}`;
+  const url = `${CONFIG.bitget.baseUrl}/api/v2/spot/market/candles?symbol=${symbol}&granularity=${granularity}&limit=${limit}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`Binance API error: ${res.status}`);
-  const data = await res.json();
+  if (!res.ok) throw new Error(`Bitget candles API error: ${res.status}`);
+  const json = await res.json();
 
-  return data.map((k) => ({
-    time: k[0],
+  if (json.code !== "00000") {
+    throw new Error(`Bitget candles error: ${json.msg}`);
+  }
+
+  // Bitget returns: [timestamp, open, high, low, close, baseVol, quoteVol]
+  // Results are newest-first, so reverse to get chronological order
+  return json.data.reverse().map((k) => ({
+    time: parseInt(k[0]),
     open: parseFloat(k[1]),
     high: parseFloat(k[2]),
     low: parseFloat(k[3]),
@@ -179,62 +183,20 @@ function runSafetyCheck(price, prevClose, sma20, sma20Prev, sma200, vwap) {
 
   if (bullishTrend) {
     console.log("  Bias: BULLISH — checking long entry conditions\n");
-
-    check(
-      "Price above 200 SMA (uptrend)",
-      `> ${sma200.toFixed(2)}`,
-      price.toFixed(2),
-      price > sma200,
-    );
-
-    check(
-      "Price above VWAP (Trend Friend — buyers in control)",
-      `> ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price > vwap,
-    );
-
-    check(
-      "20 SMA bullish crossover (entry signal)",
-      `prev < ${sma20Prev.toFixed(2)}, now > ${sma20.toFixed(2)}`,
-      `${prevClose.toFixed(2)} → ${price.toFixed(2)}`,
-      crossoverBullish,
-    );
+    check("Price above 200 SMA (uptrend)", `> ${sma200.toFixed(2)}`, price.toFixed(2), price > sma200);
+    check("Price above VWAP (Trend Friend — buyers in control)", `> ${vwap.toFixed(2)}`, price.toFixed(2), price > vwap);
+    check("20 SMA bullish crossover (entry signal)", `prev < ${sma20Prev.toFixed(2)}, now > ${sma20.toFixed(2)}`, `${prevClose.toFixed(2)} → ${price.toFixed(2)}`, crossoverBullish);
   } else if (bearishTrend) {
     console.log("  Bias: BEARISH — checking short entry conditions\n");
-
-    check(
-      "Price below 200 SMA (downtrend)",
-      `< ${sma200.toFixed(2)}`,
-      price.toFixed(2),
-      price < sma200,
-    );
-
-    check(
-      "Price below VWAP (Trend Friend — sellers in control)",
-      `< ${vwap.toFixed(2)}`,
-      price.toFixed(2),
-      price < vwap,
-    );
-
-    check(
-      "20 SMA bearish crossover (entry signal)",
-      `prev > ${sma20Prev.toFixed(2)}, now < ${sma20.toFixed(2)}`,
-      `${prevClose.toFixed(2)} → ${price.toFixed(2)}`,
-      crossoverBearish,
-    );
+    check("Price below 200 SMA (downtrend)", `< ${sma200.toFixed(2)}`, price.toFixed(2), price < sma200);
+    check("Price below VWAP (Trend Friend — sellers in control)", `< ${vwap.toFixed(2)}`, price.toFixed(2), price < vwap);
+    check("20 SMA bearish crossover (entry signal)", `prev > ${sma20Prev.toFixed(2)}, now < ${sma20.toFixed(2)}`, `${prevClose.toFixed(2)} → ${price.toFixed(2)}`, crossoverBearish);
   } else {
     console.log("  Bias: NEUTRAL — SMA200 and VWAP not aligned. No trade.\n");
-    results.push({
-      label: "Market bias",
-      required: "Price aligned with SMA200 and VWAP",
-      actual: "Neutral",
-      pass: false,
-    });
+    results.push({ label: "Market bias", required: "Price aligned with SMA200 and VWAP", actual: "Neutral", pass: false });
   }
 
   const allPass = results.every((r) => r.pass);
-  // Hold while price remains above all three indicators (exit trigger)
   const bullishBias = price > sma20 && price > sma200 && price > vwap;
   const bearishBias = price < sma20 && price < sma200 && price < vwap;
   return { results, allPass, bullishBias, bearishBias };
@@ -248,32 +210,20 @@ function checkTradeLimits(log) {
   console.log("\n── Trade Limits ─────────────────────────────────────────\n");
 
   if (todayCount >= CONFIG.maxTradesPerDay) {
-    console.log(
-      `🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`,
-    );
+    console.log(`🚫 Max trades per day reached: ${todayCount}/${CONFIG.maxTradesPerDay}`);
     return { allowed: false, reason: `Max trades per day reached (${todayCount}/${CONFIG.maxTradesPerDay})` };
   }
 
-  console.log(
-    `✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`,
-  );
+  console.log(`✅ Trades today: ${todayCount}/${CONFIG.maxTradesPerDay} — within limit`);
 
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
+  const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
 
   if (tradeSize > CONFIG.maxTradeSizeUSD) {
-    console.log(
-      `🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`,
-    );
+    console.log(`🚫 Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}`);
     return { allowed: false, reason: `Trade size $${tradeSize.toFixed(2)} exceeds max $${CONFIG.maxTradeSizeUSD}` };
   }
 
-  console.log(
-    `✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`,
-  );
-
+  console.log(`✅ Trade size: $${tradeSize.toFixed(2)} — within max $${CONFIG.maxTradeSizeUSD}`);
   return { allowed: true, reason: "" };
 }
 
@@ -281,19 +231,15 @@ function checkTradeLimits(log) {
 
 function signBitGet(timestamp, method, path, body = "") {
   const message = `${timestamp}${method}${path}${body}`;
-  return crypto
-    .createHmac("sha256", CONFIG.bitget.secretKey)
-    .update(message)
-    .digest("base64");
+  return crypto.createHmac("sha256", CONFIG.bitget.secretKey).update(message).digest("base64");
 }
 
 async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   const quantity = (sizeUSD / price).toFixed(6);
   const timestamp = Date.now().toString();
-  const path =
-    CONFIG.tradeMode === "spot"
-      ? "/api/v2/spot/trade/placeOrder"
-      : "/api/v2/mix/order/placeOrder";
+  const path = CONFIG.tradeMode === "spot"
+    ? "/api/v2/spot/trade/placeOrder"
+    : "/api/v2/mix/order/placeOrder";
 
   const body = JSON.stringify({
     symbol,
@@ -322,10 +268,7 @@ async function placeBitGetOrder(symbol, side, sizeUSD, price) {
   });
 
   const data = await res.json();
-  if (data.code !== "00000") {
-    throw new Error(`BitGet order failed: ${data.msg}`);
-  }
-
+  if (data.code !== "00000") throw new Error(`BitGet order failed: ${data.msg}`);
   return data.data;
 }
 
@@ -348,28 +291,13 @@ function savePositions(data) {
 
 const CSV_FILE = dataPath("trades.csv");
 const CSV_HEADERS = [
-  "Date",
-  "Time (UTC)",
-  "Symbol",
-  "Decision",
-  "Side",
-  "Entry Price",
-  "Exit Price",
-  "Quantity",
-  "P&L USD",
-  "Running Balance USD",
-  "Price",
-  "SMA20",
-  "SMA200",
-  "VWAP",
-  "Mode",
-  "Block Reason",
-  "Notes",
+  "Date","Time (UTC)","Symbol","Decision","Side","Entry Price","Exit Price",
+  "Quantity","P&L USD","Running Balance USD","Price","SMA20","SMA200","VWAP",
+  "Mode","Block Reason","Notes",
 ].join(",");
 
 function initCsv() {
   if (existsSync(CSV_FILE)) {
-    // Archive old format if it has the old headers
     const firstLine = readFileSync(CSV_FILE, "utf8").split("\n")[0];
     if (!firstLine.includes("Decision")) {
       const archiveName = dataPath(`trades-archive-${Date.now()}.csv`);
@@ -383,52 +311,22 @@ function initCsv() {
   }
 }
 
-function writeDecisionRow({
-  decision,
-  symbol,
-  side = "",
-  entryPrice = null,
-  exitPrice = null,
-  quantity = null,
-  pnl = null,
-  runningBalance,
-  price = null,
-  sma20 = null,
-  sma200 = null,
-  vwap = null,
-  timestamp,
-  mode,
-  blockReason = "",
-  notes = "",
-}) {
+function writeDecisionRow({ decision, symbol, side = "", entryPrice = null, exitPrice = null,
+  quantity = null, pnl = null, runningBalance, price = null, sma20 = null, sma200 = null,
+  vwap = null, timestamp, mode, blockReason = "", notes = "" }) {
   const now = new Date(timestamp);
   const date = now.toISOString().slice(0, 10);
   const time = now.toISOString().slice(11, 19);
   const fmt = (v, dp = 2) => v !== null && v !== undefined ? v.toFixed(dp) : "";
 
   const row = [
-    date,
-    time,
-    symbol,
-    decision,
-    side,
-    fmt(entryPrice),
-    fmt(exitPrice),
-    fmt(quantity, 6),
-    fmt(pnl),
-    fmt(runningBalance),
-    fmt(price),
-    fmt(sma20),
-    fmt(sma200),
-    fmt(vwap),
-    mode,
-    `"${blockReason}"`,
-    `"${notes}"`,
+    date, time, symbol, decision, side,
+    fmt(entryPrice), fmt(exitPrice), fmt(quantity, 6), fmt(pnl), fmt(runningBalance),
+    fmt(price), fmt(sma20), fmt(sma200), fmt(vwap), mode,
+    `"${blockReason}"`, `"${notes}"`,
   ].join(",");
 
-  if (!existsSync(CSV_FILE)) {
-    writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
-  }
+  if (!existsSync(CSV_FILE)) writeFileSync(CSV_FILE, CSV_HEADERS + "\n");
   appendFileSync(CSV_FILE, row + "\n");
   console.log(`📄 Decision logged [${decision}] → ${CSV_FILE}`);
 }
@@ -454,9 +352,7 @@ function generateTaxSummary() {
   const losses = sells.filter((r) => parseFloat(r[8] || 0) <= 0).length;
 
   let currentBalance = CONFIG.portfolioValue;
-  if (sells.length > 0) {
-    currentBalance = parseFloat(sells[sells.length - 1][9]);
-  }
+  if (sells.length > 0) currentBalance = parseFloat(sells[sells.length - 1][9]);
 
   console.log("\n── Tax Summary ──────────────────────────────────────────\n");
   console.log(`  Starting balance       : $${CONFIG.portfolioValue.toFixed(2)}`);
@@ -467,9 +363,7 @@ function generateTaxSummary() {
   console.log(`  Total exits (SELL)     : ${sells.length}`);
   console.log(`  Winning trades         : ${wins}`);
   console.log(`  Losing trades          : ${losses}`);
-  if (sells.length > 0) {
-    console.log(`  Win rate               : ${((wins / sells.length) * 100).toFixed(0)}%`);
-  }
+  if (sells.length > 0) console.log(`  Win rate               : ${((wins / sells.length) * 100).toFixed(0)}%`);
   console.log(`  ─────────────────────────────────────────────────────`);
   console.log(`  Paper trades           : ${paper.length}`);
   console.log(`  Live trades            : ${live.length}`);
@@ -485,9 +379,7 @@ async function run() {
   console.log("═══════════════════════════════════════════════════════════");
   console.log("  Claude Trading Bot");
   console.log(`  ${new Date().toISOString()}`);
-  console.log(
-    `  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`,
-  );
+  console.log(`  Mode: ${CONFIG.paperTrading ? "📋 PAPER TRADING" : "🔴 LIVE TRADING"}`);
   console.log("═══════════════════════════════════════════════════════════");
 
   const rules = JSON.parse(readFileSync("rules.json", "utf8"));
@@ -499,8 +391,7 @@ async function run() {
   if (!allowed) {
     const positions = loadPositions();
     writeDecisionRow({
-      decision: "BLOCKED",
-      symbol: CONFIG.symbol,
+      decision: "BLOCKED", symbol: CONFIG.symbol,
       runningBalance: positions.runningBalance,
       timestamp: new Date().toISOString(),
       mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
@@ -510,8 +401,8 @@ async function run() {
     return;
   }
 
-  // Fetch candle data
-  console.log("\n── Fetching market data from Binance ───────────────────\n");
+  // Fetch candle data from Bitget
+  console.log("\n── Fetching market data from Bitget ────────────────────\n");
   const candles = await fetchCandles(CONFIG.symbol, CONFIG.timeframe, 500);
   const closes = candles.map((c) => c.close);
   const price = closes[closes.length - 1];
@@ -534,14 +425,7 @@ async function run() {
   }
 
   const { results, allPass, bullishBias } = runSafetyCheck(price, prevClose, sma20, sma20Prev, sma200, vwap);
-
-  const tradeSize = Math.min(
-    CONFIG.portfolioValue * 0.01,
-    CONFIG.maxTradeSizeUSD,
-  );
-
-  // ─── Position Management ──────────────────────────────────────────────────
-
+  const tradeSize = Math.min(CONFIG.portfolioValue * 0.01, CONFIG.maxTradeSizeUSD);
   const positions = loadPositions();
 
   console.log("\n── Decision ─────────────────────────────────────────────\n");
@@ -563,18 +447,10 @@ async function run() {
       console.log(`   Balance: $${newBalance.toFixed(2)}`);
 
       writeDecisionRow({
-        decision: "SELL",
-        symbol: CONFIG.symbol,
-        side: "SELL",
-        entryPrice: pos.entryPrice,
-        exitPrice: price,
-        quantity: pos.quantity,
-        pnl,
-        runningBalance: newBalance,
-        price,
-        sma20,
-        sma200,
-        vwap,
+        decision: "SELL", symbol: CONFIG.symbol, side: "SELL",
+        entryPrice: pos.entryPrice, exitPrice: price,
+        quantity: pos.quantity, pnl, runningBalance: newBalance,
+        price, sma20, sma200, vwap,
         timestamp: new Date().toISOString(),
         mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
         notes: "Exit — bias no longer bullish",
@@ -590,16 +466,10 @@ async function run() {
       console.log(`   Balance (excl. open trade): $${positions.runningBalance.toFixed(2)}`);
 
       writeDecisionRow({
-        decision: "HOLD",
-        symbol: CONFIG.symbol,
-        side: "BUY",
-        entryPrice: pos.entryPrice,
-        quantity: pos.quantity,
+        decision: "HOLD", symbol: CONFIG.symbol, side: "BUY",
+        entryPrice: pos.entryPrice, quantity: pos.quantity,
         runningBalance: positions.runningBalance,
-        price,
-        sma20,
-        sma200,
-        vwap,
+        price, sma20, sma200, vwap,
         timestamp: new Date().toISOString(),
         mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
         notes: `Unrealised P&L: ${unrealisedPnl >= 0 ? "+" : ""}$${unrealisedPnl.toFixed(2)}`,
@@ -613,13 +483,9 @@ async function run() {
       failed.forEach((f) => console.log(`   - ${f}`));
 
       writeDecisionRow({
-        decision: "BLOCKED",
-        symbol: CONFIG.symbol,
+        decision: "BLOCKED", symbol: CONFIG.symbol,
         runningBalance: positions.runningBalance,
-        price,
-        sma20,
-        sma200,
-        vwap,
+        price, sma20, sma200, vwap,
         timestamp: new Date().toISOString(),
         mode: CONFIG.paperTrading ? "PAPER" : "LIVE",
         blockReason: failed.join("; "),
@@ -634,28 +500,17 @@ async function run() {
         console.log(`   (Set PAPER_TRADING=false in Railway env vars to place real orders)`);
 
         positions.openPosition = {
-          symbol: CONFIG.symbol,
-          entryPrice: price,
-          quantity,
-          tradeSize,
-          entryTime: new Date().toISOString(),
+          symbol: CONFIG.symbol, entryPrice: price,
+          quantity, tradeSize, entryTime: new Date().toISOString(),
         };
         savePositions(positions);
 
         writeDecisionRow({
-          decision: "BUY",
-          symbol: CONFIG.symbol,
-          side: "BUY",
-          entryPrice: price,
-          quantity,
-          runningBalance: positions.runningBalance,
-          price,
-          sma20,
-          sma200,
-          vwap,
+          decision: "BUY", symbol: CONFIG.symbol, side: "BUY",
+          entryPrice: price, quantity, runningBalance: positions.runningBalance,
+          price, sma20, sma200, vwap,
           timestamp: new Date().toISOString(),
-          mode: "PAPER",
-          notes: "Entry — all conditions met",
+          mode: "PAPER", notes: "Entry — all conditions met",
         });
       } else {
         console.log(`✅ ALL CONDITIONS MET`);
@@ -664,29 +519,18 @@ async function run() {
           const order = await placeBitGetOrder(CONFIG.symbol, "buy", tradeSize, price);
 
           positions.openPosition = {
-            symbol: CONFIG.symbol,
-            entryPrice: price,
-            quantity,
-            tradeSize,
-            entryTime: new Date().toISOString(),
+            symbol: CONFIG.symbol, entryPrice: price,
+            quantity, tradeSize, entryTime: new Date().toISOString(),
             orderId: order.orderId,
           };
           savePositions(positions);
 
           writeDecisionRow({
-            decision: "BUY",
-            symbol: CONFIG.symbol,
-            side: "BUY",
-            entryPrice: price,
-            quantity,
-            runningBalance: positions.runningBalance,
-            price,
-            sma20,
-            sma200,
-            vwap,
+            decision: "BUY", symbol: CONFIG.symbol, side: "BUY",
+            entryPrice: price, quantity, runningBalance: positions.runningBalance,
+            price, sma20, sma200, vwap,
             timestamp: new Date().toISOString(),
-            mode: "LIVE",
-            notes: `Order ${order.orderId}`,
+            mode: "LIVE", notes: `Order ${order.orderId}`,
           });
 
           console.log(`✅ ORDER PLACED — ${order.orderId}`);
@@ -716,7 +560,6 @@ async function run() {
   log.trades.push(logEntry);
   saveLog(log);
   console.log(`\nDecision log saved → ${LOG_FILE}`);
-
   console.log("═══════════════════════════════════════════════════════════\n");
 }
 
